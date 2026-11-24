@@ -2,3 +2,4 @@ build/
 dist/
 coverage.out*
 vmlinux.h
+OPTIMIZATION_*

@@ -63,8 +63,8 @@ func TestClearMapStopsOnCancel(t *testing.T) {
 }
 
 func TestParseEvent(t *testing.T) {
-	// 192.168.1.5:80, порт в network byte order (0x0050), плюс паддинг структуры.
-	sample := []byte{192, 168, 1, 5, 0x00, 0x50, 0x00, 0x00}
+	// 192.168.1.5:80 as written by bpfel, including struct padding.
+	sample := []byte{5, 1, 168, 192, 0x50, 0x00, 0x00, 0x00}
 	event, ok := parseEvent(sample)
 	if !ok {
 		t.Fatal("parseEvent() rejected a valid sample")

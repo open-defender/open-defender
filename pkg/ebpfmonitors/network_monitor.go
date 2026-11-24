@@ -191,9 +191,10 @@ func parseEvent(sample []byte) (NetworkEvent, bool) {
 	if len(sample) < 6 {
 		return NetworkEvent{}, false
 	}
+	// The bpfel program writes host-order fields to the ring buffer.
 	return NetworkEvent{
-		SrcIP:    binary.BigEndian.Uint32(sample[0:4]),
-		DestPort: binary.BigEndian.Uint16(sample[4:6]),
+		SrcIP:    binary.LittleEndian.Uint32(sample[0:4]),
+		DestPort: binary.LittleEndian.Uint16(sample[4:6]),
 	}, true
 }
 

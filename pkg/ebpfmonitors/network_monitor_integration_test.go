@@ -28,7 +28,7 @@ func closedLoopbackPort(t *testing.T) int {
 	return port
 }
 
-func TestRunDetectsResetIntegration(t *testing.T) {
+func TestRunDetectsSYNIntegration(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("loading eBPF requires root, skipping")
 	}
@@ -69,7 +69,7 @@ func TestRunDetectsResetIntegration(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	want := fmt.Sprintf("hit blacklisted port %d", port)
+	want := fmt.Sprintf("ip 127.0.0.1 hit blacklisted port %d", port)
 	deadline := time.After(10 * time.Second)
 	got := false
 loop:
@@ -97,6 +97,6 @@ loop:
 	}
 
 	if !got {
-		t.Fatalf("did not observe a reset event for port %d", port)
+		t.Fatalf("did not observe a SYN event matching %q", want)
 	}
 }
