@@ -3,11 +3,14 @@ package monitor
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/process"
 )
 
@@ -60,23 +63,39 @@ func (mh *monitorHub) collectProcessUsages() ([]processUsage, error) {
 	}
 
 	usages := make([]processUsage, 0, len(processes))
+	if len(processes) == 0 {
+		return usages, nil
+	}
+
+	var totalMemory uint64
+	if memory, err := mem.VirtualMemoryWithContext(mh.ctx); err == nil && memory != nil {
+		totalMemory = memory.Total
+	}
+	usernames := make(map[int32]string)
 
 	for _, proc := range processes {
 		usage := processUsage{pid: proc.Pid}
-		if user, err := proc.UsernameWithContext(mh.ctx); err == nil {
-			usage.user = user
+		if uids, err := proc.UidsWithContext(mh.ctx); err == nil && len(uids) > 0 {
+			uid := uids[0]
+			username, cached := usernames[uid]
+			if !cached {
+				if account, err := user.LookupId(strconv.Itoa(int(uid))); err == nil {
+					username = account.Username
+				}
+				usernames[uid] = username
+			}
+			usage.user = username
 		}
 
 		if cpuPercent, err := proc.CPUPercentWithContext(mh.ctx); err == nil {
 			usage.cpuPercent = cpuPercent
 		}
 
-		if memPercent, err := proc.MemoryPercentWithContext(mh.ctx); err == nil {
-			usage.memPercent = memPercent
-		}
-
 		if memoryInfo, err := proc.MemoryInfoWithContext(mh.ctx); err == nil && memoryInfo != nil {
 			usage.memoryMBs = float64(memoryInfo.RSS) / 1024 / 1024
+			if totalMemory > 0 {
+				usage.memPercent = 100 * float32(memoryInfo.RSS) / float32(totalMemory)
+			}
 		}
 
 		usage.command = mh.processCommand(proc)

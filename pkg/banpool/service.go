@@ -19,9 +19,10 @@ type BanPool interface {
 }
 
 type banPool struct {
-	repository Repository
-	firewall   Firewall
-	mutex      sync.Mutex
+	repository  Repository
+	firewall    Firewall
+	mutex       sync.Mutex
+	expirations *unbanScheduler
 }
 
 const maxUnbanRetries = 5
@@ -93,6 +94,8 @@ func (bp *banPool) RestoreBans(ctx context.Context) error {
 	for _, ban := range expired {
 		if err := bp.unban(ban.IP); err != nil {
 			log.Println(err.Error())
+		} else {
+			bp.unscheduleUnban(ban.IP)
 		}
 	}
 
@@ -112,7 +115,7 @@ func (bp *banPool) RestoreBans(ctx context.Context) error {
 			continue
 		}
 
-		go bp.waitUnban(ctx, ban)
+		bp.scheduleUnban(ctx, ban)
 	}
 
 	return nil
@@ -140,7 +143,11 @@ func (bp *banPool) BanIP(ctx context.Context, ip string, banSeconds uint64) (boo
 			return true, fmt.Errorf("banpool.BanIP(ip: %s) -> %w", ip, err)
 		}
 
-		return true, bp.extendBan(current, ban.BannedUntil)
+		if err := bp.extendBan(current, ban.BannedUntil); err != nil {
+			return true, err
+		}
+		bp.scheduleUnban(ctx, current)
+		return true, nil
 	}
 
 	id, err := bp.repository.Add(ban)
@@ -158,7 +165,7 @@ func (bp *banPool) BanIP(ctx context.Context, ip string, banSeconds uint64) (boo
 		return false, fmt.Errorf("banpool.BanIP(ip: %s) -> %w", ip, err)
 	}
 
-	go bp.waitUnban(ctx, ban)
+	bp.scheduleUnban(ctx, ban)
 
 	return false, nil
 }
@@ -167,7 +174,11 @@ func (bp *banPool) UnbanIP(ip string) error {
 	bp.mutex.Lock()
 	defer bp.mutex.Unlock()
 
-	return bp.unban(ip)
+	if err := bp.unban(ip); err != nil {
+		return err
+	}
+	bp.unscheduleUnban(ip)
+	return nil
 }
 
 func (bp *banPool) extendBan(ban *Ban, bannedUntil time.Time) error {
@@ -175,79 +186,14 @@ func (bp *banPool) extendBan(ban *Ban, bannedUntil time.Time) error {
 		return nil
 	}
 
-	ban.BannedUntil = bannedUntil
-
-	if err := bp.repository.Update(ban); err != nil {
+	updated := *ban
+	updated.BannedUntil = bannedUntil
+	if err := bp.repository.Update(&updated); err != nil {
 		return fmt.Errorf("banpool.extendBan(ip: %s) -> %w", ban.IP, err)
 	}
+	ban.BannedUntil = bannedUntil
 
 	return nil
-}
-
-func (bp *banPool) waitUnban(ctx context.Context, ban *Ban) {
-	retries := 0
-	for {
-		if !waitForContext(ctx, time.Until(ban.BannedUntil)) {
-			return
-		}
-
-		for {
-			bp.mutex.Lock()
-			current, err := bp.repository.Get(ban.IP)
-			if err != nil {
-				if !errors.Is(err, ErrBanNotFound) {
-					log.Println(err)
-				}
-				bp.mutex.Unlock()
-				return
-			}
-
-			if current.ID != ban.ID {
-				bp.mutex.Unlock()
-				return
-			}
-
-			if current.BannedUntil.After(time.Now()) {
-				ban = current
-				bp.mutex.Unlock()
-				break
-			}
-
-			err = bp.unban(ban.IP)
-			bp.mutex.Unlock()
-			if err == nil {
-				return
-			}
-			log.Println(err)
-			if retries == maxUnbanRetries {
-				return
-			}
-			retries++
-			if !waitForContext(ctx, unbanRetryInterval) {
-				return
-			}
-		}
-	}
-}
-
-func waitForContext(ctx context.Context, delay time.Duration) bool {
-	if delay <= 0 {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-			return true
-		}
-	}
-
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 func (bp *banPool) unban(ip string) error {
@@ -260,13 +206,17 @@ func (bp *banPool) unban(ip string) error {
 		return fmt.Errorf("banpool.unban(ip: %s) -> %w", ip, err)
 	}
 
-	if err := bp.firewall.Unban(ip); err != nil {
-		return fmt.Errorf("banpool.unban(ip: %s) -> %w", ip, err)
+	return bp.removeBan(ban)
+}
+
+func (bp *banPool) removeBan(ban *Ban) error {
+	if err := bp.firewall.Unban(ban.IP); err != nil {
+		return fmt.Errorf("banpool.unban(ip: %s) -> %w", ban.IP, err)
 	}
 
 	if err := bp.repository.Delete(ban.ID); err != nil {
-		return fmt.Errorf("banpool.unban(ip: %s) -> %w", ip, err)
+		return fmt.Errorf("banpool.unban(ip: %s) -> %w", ban.IP, err)
 	}
-	log.Println("Successfully unbanned ip: ", ip)
+	log.Println("Successfully unbanned ip: ", ban.IP)
 	return nil
 }

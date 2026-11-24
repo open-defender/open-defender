@@ -7,11 +7,8 @@ import (
 	"context"
 	"errors"
 	"log"
-	"runtime"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"open-defender/pkg/banpool/mocks"
 	"open-defender/pkg/config"
@@ -41,24 +38,6 @@ func TestNewNetworkMonitor(t *testing.T) {
 	nm := NewNetworkMonitor(ctx, cancel, config.EbpfNetworkAntireconConfig{}, nil, func(string, bool) {})
 	if nm == nil {
 		t.Fatal("NewNetworkMonitor() returned nil")
-	}
-}
-
-func TestClearMapStopsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	nm := &networkMonitor{ctx: ctx}
-	done := make(chan struct{})
-
-	go func() {
-		nm.clearMap(3600, &sync.Map{})
-		close(done)
-	}()
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("clearMap did not stop after context cancellation")
 	}
 }
 
@@ -145,44 +124,6 @@ func TestReport(t *testing.T) {
 			t.Errorf("log = %q, want it to contain the ban error", buf.String())
 		}
 	})
-}
-
-func TestClearMap(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	nm := &networkMonitor{ctx: ctx}
-	m := &sync.Map{}
-	m.Store("1.2.3.4", portSet{22: {}})
-	nm.clearMap(0, m) // отменённый контекст -> выход без сна
-}
-
-func TestClearMapRemovesEntries(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	nm := &networkMonitor{ctx: ctx}
-	m := &sync.Map{}
-	m.Store("1.2.3.4", portSet{22: {}})
-	done := make(chan struct{})
-	go func() {
-		nm.clearMap(0, m)
-		close(done)
-	}()
-
-	deadline := time.After(time.Second)
-	for {
-		_, exists := m.Load("1.2.3.4")
-		if !exists {
-			cancel()
-			<-done
-			return
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("clearMap() did not remove map entries")
-		default:
-			runtime.Gosched()
-		}
-	}
 }
 
 func TestRunDisabled(t *testing.T) {

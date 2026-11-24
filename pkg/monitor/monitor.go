@@ -171,21 +171,6 @@ func (mh *monitorHub) getIp(re *regexp.Regexp, message string) (string, bool) {
 
 }
 
-func (mh *monitorHub) clearMaps(ctx context.Context, seconds uint64, clearingMap *sync.Map) {
-	timer := time.NewTimer(time.Duration(seconds) * time.Second)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			clearingMap.Clear()
-			timer.Reset(time.Duration(seconds) * time.Second)
-		}
-	}
-}
-
 var goRun = func(f func()) { go f() }
 
 func (mh *monitorHub) alert(critLevel int, event protocol.AlertEvent, afterAction func()) {
@@ -225,9 +210,7 @@ func (mh *monitorHub) RunBaseMonitor(name string, bm *config.BaseFields) error {
 		return nil
 	}
 	outputChan := make(chan string, 1000)
-	ipAttemptsMap := sync.Map{}
 	re, err := regexp.Compile(bm.Pattern)
-	go mh.clearMaps(mh.ctx, bm.WindowSeconds, &ipAttemptsMap)
 	if err != nil {
 		mh.cancel()
 		return fmt.Errorf("monitor.RunBaseMonitor() -> %w: %v", ErrCompileRegexp, err)
@@ -235,17 +218,34 @@ func (mh *monitorHub) RunBaseMonitor(name string, bm *config.BaseFields) error {
 	if err := startSource(mh.ctx, bm, outputChan); err != nil {
 		return err
 	}
-	for message := range outputChan {
+	ipAttempts := make(map[string]uint64)
+	window := max(time.Second, time.Duration(bm.WindowSeconds)*time.Second)
+	windowEnd := time.Now().Add(window)
+	timer := time.NewTimer(time.Until(windowEnd))
+	defer timer.Stop()
+	for {
+		var message string
+		var received bool
+		select {
+		case <-timer.C:
+		case message, received = <-outputChan:
+			if !received {
+				return nil
+			}
+		}
+		if now := time.Now(); !now.Before(windowEnd) {
+			ipAttempts = make(map[string]uint64)
+			windowEnd = now.Add(window - now.Sub(windowEnd)%window)
+			timer.Reset(time.Until(windowEnd))
+		}
+		if !received {
+			continue
+		}
 		ip, found := mh.getIp(re, message)
 		if !found || slices.Contains(mh.cfg.IPWhiteList, ip) {
 			continue
 		}
-		raw, _ := ipAttemptsMap.LoadOrStore(ip, uint64(0))
-		counter, ok := raw.(uint64)
-		if !ok {
-			continue
-		}
-		counter += uint64(1)
+		counter := ipAttempts[ip] + 1
 		if counter >= bm.Tries {
 			isNewBan := false
 			if bm.Mode == modeBlocker {
@@ -276,67 +276,94 @@ func (mh *monitorHub) RunBaseMonitor(name string, bm *config.BaseFields) error {
 
 			counter = 0
 		}
-		ipAttemptsMap.Store(ip, counter)
+		ipAttempts[ip] = counter
 	}
-	return nil
 }
 
 func (mh *monitorHub) checkResourceMetrics(rm *config.ResourceMonitorConfig) error {
-	netBefore, err := netIOCounters(mh.ctx, false)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetTrafficUsage, err)
+	active := func(limits config.ResourceFields) bool {
+		return limits.Warning != 0 || limits.Alert != 0
 	}
-	diskBefore, err := diskIOCounters(mh.ctx)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetDiskUsage, err)
+	checkCPU := active(rm.CpuUsagePersentage)
+	checkTraffic := active(rm.TrafficUsageMBs)
+	checkDisk := active(rm.DiskUsageIOps)
+
+	var netBefore []net.IOCountersStat
+	var diskBefore map[string]disk.IOCountersStat
+	var err error
+	if checkTraffic {
+		netBefore, err = netIOCounters(mh.ctx, false)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetTrafficUsage, err)
+		}
+	}
+	if checkDisk {
+		diskBefore, err = diskIOCounters(mh.ctx)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetDiskUsage, err)
+		}
 	}
 
-	cpuPercents, err := cpuPercent(mh.ctx, windowPollInterval, false)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetCPUUsage, err)
-	}
-
-	netAfter, err := netIOCounters(mh.ctx, false)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetTrafficUsage, err)
-	}
-	diskAfter, err := diskIOCounters(mh.ctx)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetDiskUsage, err)
-	}
-
-	v, err := memVirtual(mh.ctx)
-	if err != nil {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetRAMUsage, err)
-	}
-
-	if len(cpuPercents) == 0 {
-		return fmt.Errorf("monitor.checkResourceMetrics() -> %w: no measurements", ErrCantGetCPUUsage)
+	var cpuUsage float64
+	if checkCPU {
+		samples, err := cpuPercent(mh.ctx, windowPollInterval, false)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetCPUUsage, err)
+		}
+		if len(samples) == 0 {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: no measurements", ErrCantGetCPUUsage)
+		}
+		cpuUsage = samples[0]
+	} else if checkTraffic || checkDisk {
+		timer := time.NewTimer(windowPollInterval)
+		defer timer.Stop()
+		select {
+		case <-mh.ctx.Done():
+			return nil
+		case <-timer.C:
+		}
 	}
 
 	seconds := windowPollInterval.Seconds()
-
-	cpuPercent := cpuPercents[0]
-	ramPercent := v.UsedPercent
-
 	var trafficMBs float64
-	if len(netBefore) > 0 && len(netAfter) > 0 {
-		rxBytes := netAfter[0].BytesRecv - netBefore[0].BytesRecv
-		txBytes := netAfter[0].BytesSent - netBefore[0].BytesSent
-		trafficMBs = float64(rxBytes+txBytes) / seconds / 1024 / 1024
-	}
-
-	var totalIOps uint64
-	for name, after := range diskAfter {
-		before, ok := diskBefore[name]
-		if !ok {
-			continue
+	if checkTraffic {
+		netAfter, err := netIOCounters(mh.ctx, false)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetTrafficUsage, err)
 		}
-		totalIOps += (after.ReadCount - before.ReadCount) + (after.WriteCount - before.WriteCount)
+		if len(netBefore) > 0 && len(netAfter) > 0 {
+			rxBytes := netAfter[0].BytesRecv - netBefore[0].BytesRecv
+			txBytes := netAfter[0].BytesSent - netBefore[0].BytesSent
+			trafficMBs = float64(rxBytes+txBytes) / seconds / 1024 / 1024
+		}
 	}
-	diskIOps := float64(totalIOps) / seconds
 
-	alerted := mh.checkLimits("cpu usage", cpuPercent, "%", rm.CpuUsagePersentage, rm.OutputTopSnapshotDir)
+	var diskIOps float64
+	if checkDisk {
+		diskAfter, err := diskIOCounters(mh.ctx)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetDiskUsage, err)
+		}
+		var totalIOps uint64
+		for name, after := range diskAfter {
+			before, ok := diskBefore[name]
+			if ok {
+				totalIOps += (after.ReadCount - before.ReadCount) + (after.WriteCount - before.WriteCount)
+			}
+		}
+		diskIOps = float64(totalIOps) / seconds
+	}
+
+	var ramPercent float64
+	if active(rm.RamUsagePersentage) {
+		v, err := memVirtual(mh.ctx)
+		if err != nil {
+			return fmt.Errorf("monitor.checkResourceMetrics() -> %w: %v", ErrCantGetRAMUsage, err)
+		}
+		ramPercent = v.UsedPercent
+	}
+
+	alerted := mh.checkLimits("cpu usage", cpuUsage, "%", rm.CpuUsagePersentage, rm.OutputTopSnapshotDir)
 	alerted = mh.checkLimits("ram usage", ramPercent, "%", rm.RamUsagePersentage, rm.OutputTopSnapshotDir) || alerted
 	alerted = mh.checkLimits("traffic usage", trafficMBs, "mb/s", rm.TrafficUsageMBs, rm.OutputTopSnapshotDir) || alerted
 	alerted = mh.checkLimits("disk usage", diskIOps, "iops", rm.DiskUsageIOps, rm.OutputTopSnapshotDir) || alerted

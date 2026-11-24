@@ -19,7 +19,14 @@ func NewRepositoryForTest(db DB) Repository {
 }
 
 func WaitUnbanForTest(bp BanPool, ctx context.Context, ban *Ban) {
-	bp.(*banPool).waitUnban(ctx, ban)
+	pool := bp.(*banPool)
+	pool.mutex.Lock()
+	pool.scheduleUnban(ctx, ban)
+	scheduler := pool.expirations
+	pool.mutex.Unlock()
+	if scheduler != nil {
+		<-scheduler.done
+	}
 }
 
 func SetUnbanRetryIntervalForTest(interval time.Duration) func() {
