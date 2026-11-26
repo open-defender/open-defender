@@ -12,7 +12,7 @@ import (
 	"open-defender/pkg/banpool"
 	"open-defender/pkg/config"
 	ebpfmonitors "open-defender/pkg/ebpfmonitors/gobpfs"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/cilium/ebpf/link"
@@ -99,24 +99,34 @@ func (nm *networkMonitor) Run() error {
 	}
 	defer reader.Close()
 
-	go func() {
-		<-nm.ctx.Done()
+	stopReading := context.AfterFunc(nm.ctx, func() {
 		reader.Close()
-	}()
+	})
+	defer stopReading()
 
 	whitelist := portsToSet(nm.cfg.WhitelistPorts)
 	blacklist := portsToSet(nm.cfg.BlacklistPorts)
 
-	ipPortsMap := sync.Map{}
-	go nm.clearMap(nm.cfg.WindowSeconds, &ipPortsMap)
+	ipPorts := make(map[uint32]portSet)
+	window := max(time.Second, time.Duration(nm.cfg.WindowSeconds)*time.Second)
+	windowEnd := time.Now().Add(window)
+	reader.SetDeadline(windowEnd)
 
 	for {
 		record, err := reader.Read()
+		// A busy ring can keep serving records past its deadline.
+		if now := time.Now(); !now.Before(windowEnd) {
+			ipPorts = make(map[uint32]portSet)
+			windowEnd = now.Add(window - now.Sub(windowEnd)%window)
+			reader.SetDeadline(windowEnd)
+		}
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
 			}
-			log.Println("ebpfmonitors.Run() -> ", err)
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				log.Println("ebpfmonitors.Run() -> ", err)
+			}
 			continue
 		}
 
@@ -124,26 +134,26 @@ func (nm *networkMonitor) Run() error {
 		if !ok {
 			continue
 		}
-		ip := ipString(event.SrcIP)
-
 		if _, banned := whitelist[event.DestPort]; banned {
 			continue
 		}
 		if _, listed := blacklist[event.DestPort]; listed {
+			ip := ipString(event.SrcIP)
 			nm.report(ip, fmt.Sprintf("network_antirecon -> ip %s hit blacklisted port %d", ip, event.DestPort))
 			continue
 		}
 
-		raw, _ := ipPortsMap.LoadOrStore(ip, portSet{})
-		ports, ok := raw.(portSet)
-		if !ok {
-			continue
+		ports := ipPorts[event.SrcIP]
+		if ports == nil {
+			ports = make(portSet)
+			ipPorts[event.SrcIP] = ports
 		}
 		ports[event.DestPort] = struct{}{}
 
 		if nm.cfg.PortsCount > 0 && uint64(len(ports)) >= nm.cfg.PortsCount {
+			ip := ipString(event.SrcIP)
 			nm.report(ip, fmt.Sprintf("network_antirecon -> ip %s scanned %d ports in %ds window", ip, len(ports), nm.cfg.WindowSeconds))
-			ipPortsMap.Delete(ip)
+			delete(ipPorts, event.SrcIP)
 		}
 	}
 }
@@ -164,21 +174,6 @@ func (nm *networkMonitor) report(ip string, message string) {
 	nm.logFunction(message, isNewBan)
 }
 
-func (nm *networkMonitor) clearMap(seconds uint64, clearingMap *sync.Map) {
-	timer := time.NewTimer(time.Duration(seconds) * time.Second)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-nm.ctx.Done():
-			return
-		case <-timer.C:
-			clearingMap.Clear()
-			timer.Reset(time.Duration(seconds) * time.Second)
-		}
-	}
-}
-
 func portsToSet(ports []uint64) map[uint16]struct{} {
 	set := make(map[uint16]struct{}, len(ports))
 	for _, port := range ports {
@@ -191,9 +186,10 @@ func parseEvent(sample []byte) (NetworkEvent, bool) {
 	if len(sample) < 6 {
 		return NetworkEvent{}, false
 	}
+	// The bpfel program writes host-order fields to the ring buffer.
 	return NetworkEvent{
-		SrcIP:    binary.BigEndian.Uint32(sample[0:4]),
-		DestPort: binary.BigEndian.Uint16(sample[4:6]),
+		SrcIP:    binary.LittleEndian.Uint32(sample[0:4]),
+		DestPort: binary.LittleEndian.Uint16(sample[4:6]),
 	}, true
 }
 

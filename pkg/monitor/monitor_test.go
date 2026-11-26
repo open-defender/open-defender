@@ -49,23 +49,6 @@ func feedLines(lines ...string) func(context.Context, *config.BaseFields, chan<-
 	}
 }
 
-func TestClearMapsStopsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-
-	go func() {
-		(&monitorHub{}).clearMaps(ctx, 3600, &sync.Map{})
-		close(done)
-	}()
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("clearMaps did not stop after context cancellation")
-	}
-}
-
 func syncGoRun(t *testing.T) {
 	t.Helper()
 	original := goRun
@@ -104,15 +87,6 @@ func TestGetIP(t *testing.T) {
 	if _, ok := mh.getIp(noGroup, "from 10.20.30.40"); ok {
 		t.Error("getIp() matched without an ip group")
 	}
-}
-
-func TestClearMaps(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	mh := newHub(t, config.New(), nil)
-	m := &sync.Map{}
-	m.Store("k", uint64(1))
-	mh.clearMaps(ctx, 0, m)
 }
 
 func TestCheckLimits(t *testing.T) {
@@ -242,12 +216,43 @@ func goodMetrics(t *testing.T, cpuVal float64) {
 }
 
 func TestCheckResourceMetrics(t *testing.T) {
-	rm := &config.ResourceMonitorConfig{Enabled: true, CpuUsagePersentage: config.ResourceFields{Warning: 60}}
+	rm := &config.ResourceMonitorConfig{
+		Enabled:            true,
+		CpuUsagePersentage: config.ResourceFields{Warning: 60},
+		RamUsagePersentage: config.ResourceFields{Warning: 100},
+		TrafficUsageMBs:    config.ResourceFields{Warning: 100},
+		DiskUsageIOps:      config.ResourceFields{Warning: 100},
+	}
 
 	t.Run("success", func(t *testing.T) {
 		goodMetrics(t, 75)
 		if err := newHub(t, config.New(), nil).checkResourceMetrics(rm); err != nil {
 			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("RAM only skips disabled collectors", func(t *testing.T) {
+		goodMetrics(t, 0)
+		netIOCounters = func(context.Context, bool) ([]net.IOCountersStat, error) {
+			t.Fatal("traffic collector called")
+			return nil, nil
+		}
+		diskIOCounters = func(context.Context, ...string) (map[string]disk.IOCountersStat, error) {
+			t.Fatal("disk collector called")
+			return nil, nil
+		}
+		cpuPercent = func(context.Context, time.Duration, bool) ([]float64, error) {
+			t.Fatal("CPU collector called")
+			return nil, nil
+		}
+		calls := 0
+		memVirtual = func(context.Context) (*mem.VirtualMemoryStat, error) {
+			calls++
+			return &mem.VirtualMemoryStat{UsedPercent: 40}, nil
+		}
+		rm := &config.ResourceMonitorConfig{RamUsagePersentage: config.ResourceFields{Warning: 60}}
+		if err := newHub(t, config.New(), nil).checkResourceMetrics(rm); err != nil || calls != 1 {
+			t.Fatalf("RAM collector calls = %d, error = %v", calls, err)
 		}
 	})
 

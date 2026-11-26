@@ -7,11 +7,8 @@ import (
 	"context"
 	"errors"
 	"log"
-	"runtime"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"open-defender/pkg/banpool/mocks"
 	"open-defender/pkg/config"
@@ -44,27 +41,9 @@ func TestNewNetworkMonitor(t *testing.T) {
 	}
 }
 
-func TestClearMapStopsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	nm := &networkMonitor{ctx: ctx}
-	done := make(chan struct{})
-
-	go func() {
-		nm.clearMap(3600, &sync.Map{})
-		close(done)
-	}()
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("clearMap did not stop after context cancellation")
-	}
-}
-
 func TestParseEvent(t *testing.T) {
-	// 192.168.1.5:80, порт в network byte order (0x0050), плюс паддинг структуры.
-	sample := []byte{192, 168, 1, 5, 0x00, 0x50, 0x00, 0x00}
+	// 192.168.1.5:80 as written by bpfel, including struct padding.
+	sample := []byte{5, 1, 168, 192, 0x50, 0x00, 0x00, 0x00}
 	event, ok := parseEvent(sample)
 	if !ok {
 		t.Fatal("parseEvent() rejected a valid sample")
@@ -145,44 +124,6 @@ func TestReport(t *testing.T) {
 			t.Errorf("log = %q, want it to contain the ban error", buf.String())
 		}
 	})
-}
-
-func TestClearMap(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	nm := &networkMonitor{ctx: ctx}
-	m := &sync.Map{}
-	m.Store("1.2.3.4", portSet{22: {}})
-	nm.clearMap(0, m) // отменённый контекст -> выход без сна
-}
-
-func TestClearMapRemovesEntries(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	nm := &networkMonitor{ctx: ctx}
-	m := &sync.Map{}
-	m.Store("1.2.3.4", portSet{22: {}})
-	done := make(chan struct{})
-	go func() {
-		nm.clearMap(0, m)
-		close(done)
-	}()
-
-	deadline := time.After(time.Second)
-	for {
-		_, exists := m.Load("1.2.3.4")
-		if !exists {
-			cancel()
-			<-done
-			return
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("clearMap() did not remove map entries")
-		default:
-			runtime.Gosched()
-		}
-	}
 }
 
 func TestRunDisabled(t *testing.T) {
